@@ -1,0 +1,24 @@
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix tdb: <http://jena.hpl.hp.com/2008/tdb#> .
+@prefix fuseki: <http://jena.apache.org/fuseki#> .
+@prefix ja: <http://jena.hpl.hp.com/2005/11/Assembler#> .
+
+[] rdf:type fuseki:Server ;
+   fuseki:services (
+     [ rdf:type fuseki:Service ;
+       fuseki:name                       "mainDataset" ;
+       fuseki:serviceQuery               "query" ;
+       fuseki:serviceUpdate              "update" ;
+       fuseki:serviceReadWriteGraphStore "data" ;
+       fuseki:dataset                    <#dataset> ;
+     ]
+   ) .
+
+
+
+<#dataset> rdf:type tdb:DatasetTDB ;
+   tdb:location "../mainDataset" ;
+   tdb:defaultGraph [
+     ja:loadClass "com.hp.hpl.jena.riot.RDFDataMgr" ;
+     ja:loadRDFFile "file://../scene_objects.owl"
+   ] .
