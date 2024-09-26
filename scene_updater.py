@@ -1,8 +1,10 @@
-from rdflib import Graph, Namespace, RDF, RDFS, OWL
+from rdflib import Graph, Namespace, RDF, RDFS, OWL, URIRef
 from rdflib.namespace import XSD
 from pyfuseki import FusekiUpdate, FusekiQuery
 
-DEBUG = False
+from linker import find_link
+
+DEBUG = True
 
 class Ontology():
     # Link to Ontology Software, you probably won't change this
@@ -12,62 +14,96 @@ class Ontology():
     EX = Namespace("http://example.org/ontology#")
 
     def __init__(self):
+        self.g = Graph() # Load the ontology into an RDF graph
+        self.g.parse(self.BLUEPRINT, format="xml")
         
-        # Load the ontology into an RDF graph
-        g = Graph()
-        g.parse(self.BLUEPRINT, format="xml")  # Change the file name to your OWL file
-
-        # Get the properties of the SceneObject class
-        scene_object_properties = self.get_class_properties(g, self.EX.SceneObject)
-
-        # Print details of each property
-        print("Properties of SceneObject:")
-        for prop in scene_object_properties:
-            prop_details = self.get_property_details(g, prop)
-            prop_name = prop.split("#")[-1]
-            print(f"\nProperty: {prop_name}")
-            print(f"  Type: {prop_details['type'].split('#')[-1] if prop_details['type'] else 'Unknown'}")
-            print(f"  Range: {prop_details['range'].split('#')[-1] if prop_details['range'] else 'Unknown'}")
-            print(f"  Comment: {prop_details['comment'] if prop_details['comment'] else 'No comment available'}")
-        print("Use these properties for querying and loading the ontology")
-        input("??")
+        # Load class properties dynamically
+        self.property_names_uri = self.get_class_properties(self.EX.SceneObject)
+        self.property_names = [property_uri.split("#")[-1] for property_uri in self.property_names_uri.keys()]
 
         # Modify Scene Objects
         self.fuseki_update = FusekiUpdate(self.FUSEKI_URL, self.DATASET_NAME)
         # Read Scene Object data
         self.fuseki_query = FusekiQuery(self.FUSEKI_URL, self.DATASET_NAME)
 
-    # Function to add a SceneObject using SPARQL update
-    def add_scene_object_sparql(self, obj_id, obj_type, version, position, orientation):
+    def update(self, objects_data):
+        """Update Scene Objects based on new observations
+
+        Args:
+            objects_data (List): Format: 
+                [
+                    { # Object 1
+                        "hasType": "Drawer"
+                        "hasVersion": "Wooden Drawer"
+                        "hasPosition": 
+                        "hasOrientation"
+                    }, 
+                    { ... } # Object 2
+                ]
+        """
+        saved_scene_data = self.get_all_scene_objects() # This might be moved to call less often
+
+        for observed_scene_object in objects_data:
+            
+            is_link, link_id = find_link(saved_scene_data, observed_scene_object)
+            if is_link:
+                self.add_scene_object_sparql(link_id, observed_scene_object)
+            else:
+                self.add_scene_object_sparql(self.get_unique_id(saved_scene_data), observed_scene_object)
+
+
+    def add_scene_object_sparql(self, obj_id, object_data):
+        """Adds a SceneObject using SPARQL update. Constructs a dynamic SPARQL Update query for the SceneObject
+
+        Args:
+            obj_id (int): SceneObject Unique id, if already exists, given SceneObject is rewritten
+            object_data (dict): {"<properties": <property values>}
+        """
+        self.verify_scene_object_format(object_data)
         EX = self.EX
         
-        # Create URIs for the SceneObject and its properties
-        scene_object_uri = EX[f"SceneObject_{obj_id}"]
-        position_uri = EX[f"Position_{obj_id}"]
-        orientation_uri = EX[f"Orientation_{obj_id}"]
-        object_type_uri = EX[obj_type]
-        
-        # Construct a SPARQL Update query to add the SceneObject
+        object_query_parts = []
+        additional_triples = []
+
+        # Iterate over the properties defined in the ontology
+        for prop_uri, range_uri in self.property_names_uri.items():
+            prop_name = prop_uri.split("#")[-1]
+
+            if prop_name in object_data:
+                # Check if the property is an object property (has a class as its range) or a datatype property
+                if range_uri.startswith(str(XSD)):  # Datatype property check (e.g., xsd:string, xsd:float)
+                    # Handle regular datatype properties
+                    object_query_parts.append(f'ex:{prop_name} "{object_data[prop_name]}"^^xsd:{range_uri.split("#")[-1]}')
+                else:
+                    if isinstance(object_data[prop_name], dict):  # Handling nested properties like Position
+                        nested_query = []
+                        nested_uri = EX[f"{prop_name}_{obj_id}"]
+                        for sub_prop, value in object_data[prop_name].items():
+                            # Ensure sub_prop is a property of the nested class (e.g., x, y, z for Position)
+                            
+                            if EX[prop_name] in self.property_names_uri:
+                                nested_query.append(f"ex:{sub_prop} \"{value}\"^^xsd:float ")
+                        # Create a triple for the nested property (e.g., Position)
+                        nl = " \n\t\t"
+                        additional_triples.append(f"<{nested_uri}> a ex:{prop_name} ; \n\t\t {f' ;{nl}'.join(nested_query)} .")
+                        # Link the main object to this nested property
+                        object_query_parts.append(f"ex:{prop_name} <{nested_uri}>")
+                    else:
+                        # Handle object properties (with classes as ranges)
+                        nested_uri = EX[f"{prop_name}_{obj_id}"]
+                        object_query_parts.append(f"ex:{prop_name} <{nested_uri}>")
+                        additional_triples.append(f"<{nested_uri}> a ex:{range_uri.split('#')[-1]} .")
+
+        # Combine all parts into the final SPARQL Update query
+        nl = " \n\t\t"
+        nlc = " ; \n\t\t"
         update_query = f"""
-        PREFIX ex: <{self.EX}>
+        PREFIX ex: <{EX}>
         PREFIX xsd: <{XSD}>
         INSERT DATA {{
-            <{scene_object_uri}> a ex:SceneObject ;
-                            ex:hasType <{object_type_uri}> ;
-                            ex:hasVersion "{version}"^^xsd:string ;
-                            ex:hasPosition <{position_uri}> ;
-                            ex:hasOrientation <{orientation_uri}> .
-                            
-            <{position_uri}> a ex:Position ;
-                            ex:x "{position['x']}"^^xsd:float ;
-                            ex:y "{position['y']}"^^xsd:float ;
-                            ex:z "{position['z']}"^^xsd:float .
-                            
-            <{orientation_uri}> a ex:Orientation ;
-                            ex:qx "{orientation['qx']}"^^xsd:float ;
-                            ex:qy "{orientation['qy']}"^^xsd:float ;
-                            ex:qz "{orientation['qz']}"^^xsd:float .
-                            ex:qw "{orientation['qw']}"^^xsd:float .
+            <{EX[f"SceneObject_{obj_id}"]}> a ex:SceneObject ;
+            {nlc.join(object_query_parts)}. {nl}
+            {nl.join(additional_triples)}
         }}
         """
         
@@ -80,105 +116,126 @@ class Ontology():
             print(f"An error occurred: {e}")
 
     def get_all_scene_objects(self):
-        query = f"""
-        PREFIX ex: <{self.EX}>
-        SELECT ?sceneObject ?type ?version ?x ?y ?z ?qx ?qy ?qz ?qw
+        EX = self.EX
+        
+        # Construct the SPARQL query dynamically based on the SceneObject properties
+        query_parts = []
+        nested_properties = {}
+
+        # Prepare the dynamic query parts for known properties
+        for prop_uri, range_uri in self.property_names_uri.items():
+            prop_name = prop_uri.split("#")[-1]
+            
+            # Check if this property has nested structure
+            if isinstance(range_uri, URIRef) and not str(range_uri).startswith(str(XSD)):
+                # Nested object property like hasPosition, hasOrientation
+                nested_properties[prop_name] = range_uri
+                query_parts.append(f"?sceneObject ex:{prop_name} ?{prop_name}Uri .")
+            else:
+                # Direct property
+                query_parts.append(f"?sceneObject ex:{prop_name} ?{prop_name} .")
+
+        # Add nested properties query parts
+        nested_query_parts = []
+        nested_select_parts = []
+        for nested_prop_name, nested_range_uri in nested_properties.items():
+            nested_query = []
+            # Get nested properties (like x, y, z for Position)
+            for sub_prop_uri in self.get_class_properties(nested_range_uri):
+                sub_prop_name = sub_prop_uri.split("#")[-1]
+                nested_query.append(f"?{nested_prop_name}Uri ex:{sub_prop_name} ?{nested_prop_name}_{sub_prop_name} .")
+                nested_select_parts.append(f"?{nested_prop_name}_{sub_prop_name}")
+            nested_query_parts.append(" ".join(nested_query))
+
+        # Combine the query parts
+        full_query = f"""
+        PREFIX ex: <{EX}>
+        PREFIX xsd: <{XSD}>
+        SELECT ?sceneObject {' '.join([f'?{prop_uri.split("#")[-1]}' for prop_uri in self.property_names_uri])} {' '.join(nested_select_parts)}
         WHERE {{
-            ?sceneObject a ex:SceneObject ;
-                        ex:hasType ?type ;
-                        ex:hasVersion ?version ;
-                        ex:hasPosition ?position ;
-                        ex:hasOrientation ?orientation .
-            
-            ?position ex:x ?x ;
-                    ex:y ?y ;
-                    ex:z ?z .
-            
-            ?orientation ex:qx ?qx ;
-                         ex:qy ?qy ;
-                         ex:qz ?qz ;
-                         ex:qw ?qw .
+            {' '.join(query_parts)}
+            {' '.join(nested_query_parts)}
         }}
         """
-        
-        if DEBUG: print(f"update_query: {query}")
 
-        # Run the SPARQL query and fetch the results
+        # Debug print the query to check for issues
+        print("Generated SPARQL Query:")
+        print(full_query)
+
+        # Execute the query and process the results
         try:
-            query_results = self.fuseki_query.run_sparql(query)
-            results = query_results.convert()
+            query_result = self.fuseki_query.run_sparql(full_query)
+            results_dict = query_result.convert()  # Converts to a Python dict
             scene_objects = []
-            for result in results['results']['bindings']:
-                scene_object = {
-                    "uri": result['sceneObject']['value'],
-                    "type": result['type']['value'],
-                    "version": result['version']['value'],
-                    "position": {
-                        "x": float(result['x']['value']),
-                        "y": float(result['y']['value']),
-                        "z": float(result['z']['value'])
-                    },
-                    "orientation": {
-                        "qx": float(result['qx']['value']),
-                        "qy": float(result['qy']['value']),
-                        "qz": float(result['qz']['value']),
-                        "qw": float(result['qw']['value']),
-                    }
-                }
+            print("===")
+            print(results_dict)
+            print("===")
+            for result in results_dict['results']['bindings']:
+                scene_object = {"uri": result['sceneObject']['value']}
+
+                # Process main object properties
+                for prop_uri in self.property_names_uri:
+                    prop_name = prop_uri.split("#")[-1]
+                    if prop_name in result:
+                        if prop_name in nested_properties:
+                            # Nested property structure
+                            nested_data = {}
+                            nested_range_uri = nested_properties[prop_name]
+                            for sub_prop_uri in self.get_class_properties(nested_range_uri):
+                                sub_prop_name = sub_prop_uri.split("#")[-1]
+                                key = f"{prop_name}_{sub_prop_name}"
+                                if key in result:
+                                    nested_data[sub_prop_name] = float(result[key]['value'])
+                            scene_object[prop_name] = nested_data
+                        else:
+                            # Direct property
+                            scene_object[prop_name] = result[prop_name]['value']
+
                 scene_objects.append(scene_object)
-            
+
             return scene_objects
+
         except Exception as e:
-            print(f"An error occurred: {e}")
+            print(f"An error occurred while retrieving scene objects: {e}")
             return []
 
-    def get_class_properties(self, g, class_uri):
-        properties = []
+    def get_class_properties(self, class_uri):
+        """Get properties of a specific class from the ontology."""
+        properties = {}
         # Get all properties that have the given class as their domain
-        for s, p, o in g.triples((None, RDFS.domain, class_uri)):
-            properties.append(s)
+        for prop in self.g.subjects(RDFS.domain, class_uri):
+            # Get the range of the property (datatype or object type)
+            range_uri = self.g.value(subject=prop, predicate=RDFS.range)
+            properties[prop] = range_uri
         return properties
 
-    # Function to get the data type or object type of a property
-    def get_property_details(self, g, property_uri):
-        details = {
-            'type': None,
-            'range': None,
-            'comment': None
-        }
-        # Get the type of the property
-        for s, p, o in g.triples((property_uri, RDF.type, None)):
-            details['type'] = o
+    def verify_scene_object_format(self, object_data):
+        assert sorted(list(object_data.keys())) == sorted(self.property_names), \
+            f"Properties do not match, {sorted(list(object_data.keys()))} != {sorted(self.property_names)}"
 
-        # Get the range of the property
-        for s, p, o in g.triples((property_uri, RDFS.range, None)):
-            details['range'] = o
-
-        # Get any comments or descriptions of the property
-        for s, p, o in g.triples((property_uri, RDFS.comment, None)):
-            details['comment'] = str(o)
-
-        return details
-
-
+    def get_unique_id(self, saved_scene_data):
+        pass
 
 def main():
-    ''' Creates ontology and adds few objects'''
     o = Ontology()
     
-    # Add n scene objects dynamically to the Fuseki server
-    n = 2  # Define the number of scene objects to add
-
-    for i in range(1, n+1):
-        obj_type = "Drawer" if i % 2 == 0 else "Cup"  # Alternate between Drawer and Cup
-        version = "Wooden Drawer" if obj_type == "Drawer" else "Ceramic Cup"
-        position = {"x": i * 1.0, "y": i * 1.0, "z": i * 1.0}
-        orientation = {"qx": i * 0.1, "qy": i * 0.1, "qz": i * 0.1, "qw": i * 0.1}
-        
-        o.add_scene_object_sparql(obj_id=i, obj_type=obj_type, version=version, position=position, orientation=orientation)
-
-    # Retrieve and print all scene objects and their properties
+    # We observe some objects (get their class, position, orientation, etc.)
+    scene_objects_data = []
+    for i in range(1, 5):
+        object_data = {
+            'hasType': "Drawer" if i % 2 == 0 else "Cup",  # Alternate between Drawer and Cup
+            'hasVersion': "Wooden Drawer" if i % 2 == 0 else "Ceramic Cup",
+            'hasPosition': {"x": i * 1.0, "y": i * 1.0, "z": i * 1.0},
+            'hasOrientation': {"qx": i * 0.1, "qy": i * 0.1, "qz": i * 0.1, "qw": i * 0.1},
+        }    
+    scene_objects_data.append(object_data)
+    
+    # Then we update the ontology with the data
+    o.update(scene_objects_data)
+    
+    # Finally, retrieve and print all scene objects and their properties
     scene_objects = o.get_all_scene_objects()
+    print(scene_objects)
     for obj in scene_objects:
         print(f"SceneObject URI: {obj['uri']}")
         print(f"  Type: {obj['type']}")

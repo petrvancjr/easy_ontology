@@ -1,0 +1,5 @@
+apache-jena-fuseki-5.1.0
+mainDataset
+__pycache__
+run
+scene_objects.owl
